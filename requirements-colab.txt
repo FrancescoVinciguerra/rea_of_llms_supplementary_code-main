@@ -4,4 +4,5 @@ matplotlib>=3.8
 textstat>=0.7.3
 transformers>=4.40
 pymbar>=4.0.3
+scipy>=1.11
 pytest>=8.0

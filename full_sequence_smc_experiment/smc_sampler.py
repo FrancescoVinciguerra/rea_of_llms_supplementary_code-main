@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from scipy.special import logsumexp
 
 from rea_llms.models import set_seed
 
@@ -51,6 +52,13 @@ class FullSequenceState:
 
 
 @dataclass
+class MutationResult:
+    particles: list[FullSequenceState]
+    accepted: int
+    proposals: int
+
+
+@dataclass
 class FullSequenceSMCResult:
     samples: list[dict[str, Any]]
     summary: dict[str, Any]
@@ -76,22 +84,13 @@ def parse_float_list(value: str) -> list[float]:
     return parsed
 
 
-def logsumexp(values: np.ndarray | list[float]) -> float:
-    arr = np.asarray(values, dtype=np.float64)
-    finite = arr[np.isfinite(arr)]
-    if finite.size == 0:
-        return float("-inf")
-    max_value = float(np.max(finite))
-    return max_value + float(np.log(np.sum(np.exp(finite - max_value))))
-
-
 def normalize_log_weights(log_weights: np.ndarray) -> np.ndarray:
-    return np.asarray(log_weights, dtype=np.float64) - logsumexp(log_weights)
+    return np.asarray(log_weights, dtype=np.float64) - float(logsumexp(log_weights))
 
 
 def ess_over_n_from_log_weights(log_weights: np.ndarray) -> float:
     normalized_log = normalize_log_weights(log_weights)
-    ess = math.exp(-logsumexp(2.0 * normalized_log))
+    ess = math.exp(-float(logsumexp(2.0 * normalized_log)))
     return float(ess / len(log_weights)) if len(log_weights) else float("nan")
 
 
@@ -131,10 +130,48 @@ def generate_base_sequences(
     num_sequences: int,
     max_new_tokens: int,
     generator: torch.Generator,
+    pad_token_id: int | None = None,
 ) -> list[list[int]]:
     # Draw complete continuations from the base language model p_M. These draws
     # are used both to initialise the particle population and as independent
     # Metropolis proposals inside the full-sequence SMC mutation kernel.
+    if max_new_tokens == 0:
+        return [list(prompt_ids) for _ in range(num_sequences)]
+
+    device = next(model.parameters()).device
+    if hasattr(model, "generate"):
+        input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device).repeat(num_sequences, 1)
+        with torch.no_grad():
+            generated = model.generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                top_k=None,
+                temperature=1.0,
+                eos_token_id=None,
+                pad_token_id=pad_token_id,
+            )
+        return generated.detach().cpu().tolist()
+
+    return _generate_base_sequences_manual(
+        model,
+        prompt_ids,
+        num_sequences=num_sequences,
+        max_new_tokens=max_new_tokens,
+        generator=generator,
+    )
+
+
+def _generate_base_sequences_manual(
+    model,
+    prompt_ids: list[int],
+    *,
+    num_sequences: int,
+    max_new_tokens: int,
+    generator: torch.Generator,
+) -> list[list[int]]:
+    # Test doubles may only implement forward(). Keep a small manual fallback so
+    # unit tests can exercise the sampler without depending on Transformers.
     device = next(model.parameters()).device
     batch_ids = [list(prompt_ids) for _ in range(num_sequences)]
     for _ in range(max_new_tokens):
@@ -189,131 +226,150 @@ def states_from_token_sequences(
     return states
 
 
-def run_full_sequence_smc(
+def particle_phi_values(particles: list[FullSequenceState]) -> np.ndarray:
+    return np.asarray([particle.phi for particle in particles], dtype=np.float64)
+
+
+def sample_particles_from_base_model(
     model,
     tokenizer,
     observable,
     *,
     prompt: str,
-    config: FullSequenceSMCConfig,
-) -> FullSequenceSMCResult:
-    set_seed(config.seed)
-    device = next(model.parameters()).device
-    torch_generator = torch.Generator(device=device).manual_seed(config.seed)
-    rng = np.random.default_rng(config.seed)
-
-    prompt_ids = _prompt_ids(tokenizer, prompt)
-    prompt_token_count = len(prompt_ids)
-    start = time.perf_counter()
-
-    # Level 0 is sampled from p_M. Therefore the usual schedule should start at
-    # lambda=0; otherwise an initial importance correction would be needed.
-    initial_tokens = generate_base_sequences(
+    prompt_ids: list[int],
+    prompt_token_count: int,
+    num_particles: int,
+    max_new_tokens: int,
+    generator: torch.Generator,
+    pad_token_id: int | None = None,
+) -> list[FullSequenceState]:
+    token_sequences = generate_base_sequences(
         model,
         prompt_ids,
-        num_sequences=config.num_particles,
-        max_new_tokens=config.max_new_tokens,
-        generator=torch_generator,
+        num_sequences=num_particles,
+        max_new_tokens=max_new_tokens,
+        generator=generator,
+        pad_token_id=pad_token_id,
     )
-    particles = states_from_token_sequences(
+    return states_from_token_sequences(
         tokenizer,
         observable,
         prompt=prompt,
         prompt_token_count=prompt_token_count,
-        token_sequences=initial_tokens,
+        token_sequences=token_sequences,
     )
-    log_weights = np.zeros(config.num_particles, dtype=np.float64)
-    ess_trajectory = [1.0]
-    level_diagnostics: list[dict[str, Any]] = [
-        {
-            "level": 0,
-            "lambda": float(config.lambdas[0]),
-            "ess_over_n": 1.0,
-            "accepted": 0,
-            "proposals": 0,
-            "acceptance_rate": None,
-            "mean_phi": float(np.mean([p.phi for p in particles])),
-        }
-    ]
 
-    total_accepted = 0
-    total_proposals = 0
-# Per ogni lambda eseuog (lambda_0 ... lambda_k):
-    for level in range(1, len(config.lambdas)):
-        previous_lambda = float(config.lambdas[level - 1])
-        current_lambda = float(config.lambdas[level])
-        level_accepted = 0
-        level_proposals = 0
+def metropolis_hastings_log_acceptance_ratio(
+    *,
+    target_lambda: float,
+    current_phi: float,
+    proposal_phi: float,
+) -> float:
+    # For an independent proposal x* ~ p_M, the p_M terms cancel:
+    # log A = -lambda_{k-1} [phi(x*) - phi(x)].
+    return -target_lambda * (proposal_phi - current_phi)
 
-        
-        # Mutation step: apply a short independent-proposal MH chain targeting
-        # p_{k-1}(x) proportional to p_M(x | c) exp(-lambda_{k-1} phi(x)).
-        # The p_M proposal terms cancel, leaving only the phi difference.
-        for _ in range(config.mcmc_steps_per_level):
 
-    #genero completions
-            proposal_tokens = generate_base_sequences(
-                model,
-                prompt_ids,
-                num_sequences=config.num_particles,
-                max_new_tokens=config.max_new_tokens,
-                generator=torch_generator,
+def apply_mcmc_mutation_kernel(
+    particles: list[FullSequenceState],
+    model,
+    tokenizer,
+    observable,
+    *,
+    prompt: str,
+    prompt_ids: list[int],
+    prompt_token_count: int,
+    target_lambda: float,
+    mcmc_steps: int,
+    max_new_tokens: int,
+    torch_generator: torch.Generator,
+    rng: np.random.Generator,
+    pad_token_id: int | None = None,
+) -> MutationResult:
+    # Apply M_{k-1}: a Metropolis-Hastings kernel whose invariant distribution
+    # is p_{k-1}(x) proportional to p_M(x | c) exp(-lambda_{k-1} phi(x)).
+    mutated_particles = list(particles)
+    accepted = 0
+    proposals_count = 0
+
+    for _ in range(mcmc_steps):
+        proposals = sample_particles_from_base_model(
+            model,
+            tokenizer,
+            observable,
+            prompt=prompt,
+            prompt_ids=prompt_ids,
+            prompt_token_count=prompt_token_count,
+            num_particles=len(mutated_particles),
+            max_new_tokens=max_new_tokens,
+            generator=torch_generator,
+            pad_token_id=pad_token_id,
+        )
+        for idx, proposal in enumerate(proposals):
+            current = mutated_particles[idx]
+            log_acceptance_ratio = metropolis_hastings_log_acceptance_ratio(
+                target_lambda=target_lambda,
+                current_phi=current.phi,
+                proposal_phi=proposal.phi,
             )
-    # states_.. prende i token di completion e li separa dal blocco c, ottiene la frase completa e calcola l 'ari
-            proposals = states_from_token_sequences(
-                tokenizer,
-                observable,
-                prompt=prompt,
-                prompt_token_count=prompt_token_count,
-                token_sequences=proposal_tokens,
-            )
-    # per ogni particella ( proposal = x_k), calcolo la sua acceptance prob, e eventualmente setta la x_k come proposal
-            for idx, proposal in enumerate(proposals):
-                current = particles[idx]
-                # log A = -lambda_{k-1} [phi(x*) - phi(x)].
-                log_acceptance_ratio = -previous_lambda * (proposal.phi - current.phi)
-                acceptance_probability = acceptance_from_log_ratio(log_acceptance_ratio)
-                did_accept = bool(rng.random() < acceptance_probability)
-                level_proposals += 1
-                total_proposals += 1
-                if did_accept:
-                    particles[idx] = proposal
-                    level_accepted += 1
-                    total_accepted += 1
+            acceptance_probability = acceptance_from_log_ratio(log_acceptance_ratio)
+            proposals_count += 1
+            if bool(rng.random() < acceptance_probability):
+                mutated_particles[idx] = proposal
+                accepted += 1
 
-        phi_values = np.asarray([particle.phi for particle in particles], dtype=np.float64)
-        # Reweight from gamma_{k-1} to gamma_k:
-        # log w_k = log w_{k-1} - (lambda_k - lambda_{k-1}) phi(x).
-        log_weights = log_weights - (current_lambda - previous_lambda) * phi_values
-        ess_over_n = ess_over_n_from_log_weights(log_weights)
-        ess_trajectory.append(ess_over_n)
-        level_diagnostics.append(
+    return MutationResult(particles=mutated_particles, accepted=accepted, proposals=proposals_count)
+
+
+def update_log_weights_for_lambda_step(
+    log_weights: np.ndarray,
+    particles: list[FullSequenceState],
+    *,
+    previous_lambda: float,
+    current_lambda: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    phi_values = particle_phi_values(particles)
+    # log w_k = log w_{k-1} - (lambda_k - lambda_{k-1}) phi(X_k).
+    updated_log_weights = log_weights - (current_lambda - previous_lambda) * phi_values
+    return updated_log_weights, phi_values
+
+
+def make_level_diagnostic(
+    *,
+    level: int,
+    current_lambda: float,
+    previous_lambda: float | None,
+    ess_over_n: float,
+    accepted: int,
+    proposals: int,
+    mean_phi: float,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "level": int(level),
+        "lambda": float(current_lambda),
+        "ess_over_n": float(ess_over_n),
+        "accepted": int(accepted),
+        "proposals": int(proposals),
+        "acceptance_rate": float(accepted / proposals) if proposals else None,
+        "mean_phi": float(mean_phi),
+    }
+    if previous_lambda is not None:
+        row.update(
             {
-                "level": level,
-                "lambda": current_lambda,
-                "previous_lambda": previous_lambda,
-                "delta_lambda": current_lambda - previous_lambda,
-                "ess_over_n": ess_over_n,
-                "accepted": int(level_accepted),
-                "proposals": int(level_proposals),
-                "acceptance_rate": float(level_accepted / level_proposals) if level_proposals else None,
-                "mean_phi": float(np.mean(phi_values)),
+                "previous_lambda": float(previous_lambda),
+                "delta_lambda": float(current_lambda - previous_lambda),
             }
         )
+    return row
 
-    elapsed = time.perf_counter() - start
-    # Normalised weights define the final empirical approximation of p_K.
-    normalized_log_weights = normalize_log_weights(log_weights)
-    normalized_weights = np.exp(normalized_log_weights)
-    final_phi = np.asarray([particle.phi for particle in particles], dtype=np.float64)
-    rare_events = np.asarray(
-        [
-            rare_event_indicator(float(phi), config.rare_event_threshold, config.rare_event_direction)
-            for phi in final_phi
-        ],
-        dtype=bool,
-    )
 
+def build_weighted_particle_samples(
+    particles: list[FullSequenceState],
+    *,
+    log_weights: np.ndarray,
+    normalized_weights: np.ndarray,
+    rare_events: np.ndarray,
+) -> list[dict[str, Any]]:
     samples: list[dict[str, Any]] = []
     for idx, (particle, log_weight, normalized_weight, is_event) in enumerate(
         zip(particles, log_weights, normalized_weights, rare_events)
@@ -334,6 +390,124 @@ def run_full_sequence_smc(
                 "metadata": particle.metadata,
             }
         )
+    return samples
+
+
+def run_full_sequence_smc(
+    model,
+    tokenizer,
+    observable,
+    *,
+    prompt: str,
+    config: FullSequenceSMCConfig,
+) -> FullSequenceSMCResult:
+    set_seed(config.seed)
+    device = next(model.parameters()).device
+    torch_generator = torch.Generator(device=device).manual_seed(config.seed)
+    rng = np.random.default_rng(config.seed)
+
+    prompt_ids = _prompt_ids(tokenizer, prompt)
+    prompt_token_count = len(prompt_ids)
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    start = time.perf_counter()
+
+    # X_0^{(i)} ~ p_M(. | c), with initial log weights log w_0^{(i)} = 0.
+    # The usual schedule should start at lambda=0; otherwise an initial
+    # importance correction would be needed.
+    particles = sample_particles_from_base_model(
+        model,
+        tokenizer,
+        observable,
+        prompt=prompt,
+        prompt_ids=prompt_ids,
+        prompt_token_count=prompt_token_count,
+        num_particles=config.num_particles,
+        max_new_tokens=config.max_new_tokens,
+        generator=torch_generator,
+        pad_token_id=pad_token_id,
+    )
+    log_weights = np.zeros(config.num_particles, dtype=np.float64)
+    initial_phi = particle_phi_values(particles)
+    ess_trajectory = [1.0]
+    level_diagnostics: list[dict[str, Any]] = [
+        make_level_diagnostic(
+            level=0,
+            current_lambda=float(config.lambdas[0]),
+            previous_lambda=None,
+            ess_over_n=1.0,
+            accepted=0,
+            proposals=0,
+            mean_phi=float(np.mean(initial_phi)),
+        )
+    ]
+
+    total_accepted = 0
+    total_proposals = 0
+
+    # For k = 1, ..., K: mutate particles with M_{k-1}, then reweight from
+    # gamma_{k-1} to gamma_k.
+    for level in range(1, len(config.lambdas)):
+        previous_lambda = float(config.lambdas[level - 1])
+        current_lambda = float(config.lambdas[level])
+
+        mutation = apply_mcmc_mutation_kernel(
+            particles,
+            model,
+            tokenizer,
+            observable,
+            prompt=prompt,
+            prompt_ids=prompt_ids,
+            prompt_token_count=prompt_token_count,
+            target_lambda=previous_lambda,
+            mcmc_steps=config.mcmc_steps_per_level,
+            max_new_tokens=config.max_new_tokens,
+            torch_generator=torch_generator,
+            rng=rng,
+            pad_token_id=pad_token_id,
+        )
+        particles = mutation.particles
+        total_accepted += mutation.accepted
+        total_proposals += mutation.proposals
+
+        log_weights, phi_values = update_log_weights_for_lambda_step(
+            log_weights,
+            particles,
+            previous_lambda=previous_lambda,
+            current_lambda=current_lambda,
+        )
+        ess_over_n = ess_over_n_from_log_weights(log_weights)
+        ess_trajectory.append(ess_over_n)
+        level_diagnostics.append(
+            make_level_diagnostic(
+                level=level,
+                current_lambda=current_lambda,
+                previous_lambda=previous_lambda,
+                ess_over_n=ess_over_n,
+                accepted=mutation.accepted,
+                proposals=mutation.proposals,
+                mean_phi=float(np.mean(phi_values)),
+            )
+        )
+
+    elapsed = time.perf_counter() - start
+    # W_K^{(i)} = w_K^{(i)} / sum_j w_K^{(j)}.
+    normalized_log_weights = normalize_log_weights(log_weights)
+    normalized_weights = np.exp(normalized_log_weights)
+    final_phi = particle_phi_values(particles)
+    rare_events = np.asarray(
+        [
+            rare_event_indicator(float(phi), config.rare_event_threshold, config.rare_event_direction)
+            for phi in final_phi
+        ],
+        dtype=bool,
+    )
+
+    samples = build_weighted_particle_samples(
+        particles,
+        log_weights=log_weights,
+        normalized_weights=normalized_weights,
+        rare_events=rare_events,
+    )
 
     final_ess_over_n = ess_trajectory[-1]
     min_ess_over_n = float(np.min(np.asarray(ess_trajectory, dtype=np.float64)))

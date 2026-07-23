@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
+from scipy.special import logsumexp
 
 
 @dataclass(frozen=True)
@@ -94,26 +95,19 @@ def normalize_rhos(rhos: Iterable[float]) -> list[float]:
     return (arr / total).astype(float).tolist()
 
 
-def logsumexp(values: Iterable[float]) -> float:
-    arr = np.asarray(list(values), dtype=np.float64)
-    finite = arr[np.isfinite(arr)]
-    if finite.size == 0:
-        return float("-inf")
-    max_value = float(np.max(finite))
-    return max_value + float(np.log(np.sum(np.exp(finite - max_value))))
-
-
 def log_mixture_tilt(phi: float, lambdas: list[float], rhos: list[float]) -> float:
     # log sum_k rho_k exp(-lambda_k phi). The p_M(x | c) factor cancels from
     # all mixture acceptance ratios and from the SNIS weights used below.
-    return logsumexp(math.log(rho) - lam * phi for lam, rho in zip(lambdas, rhos) if rho > 0.0)
+    terms = [math.log(rho) - lam * phi for lam, rho in zip(lambdas, rhos) if rho > 0.0]
+    return float(logsumexp(terms))
 
 
 def log_component_correction_sum(phi: float, component_index: int, lambdas: list[float], rhos: list[float]) -> float:
     # log S_k(x), where S_k(x) = Gamma_mix(x) / gamma_k(x). This correction
     # turns a component-wise MH move into a valid move for the full mixture.
     lambda_k = lambdas[component_index]
-    return logsumexp(math.log(rho) - (lam - lambda_k) * phi for lam, rho in zip(lambdas, rhos) if rho > 0.0)
+    terms = [math.log(rho) - (lam - lambda_k) * phi for lam, rho in zip(lambdas, rhos) if rho > 0.0]
+    return float(logsumexp(terms))
 
 
 def acceptance_from_log_ratio(log_ratio: float) -> float:
@@ -148,7 +142,7 @@ def importance_summary(phi_values: list[float], *, lambdas: list[float], rhos: l
         }
     # SNIS back to p_M: p_M / Gamma_mix = 1 / sum_k rho_k exp(-lambda_k phi).
     log_weights = np.asarray([-log_mixture_tilt(phi, lambdas, rhos) for phi in phi_values], dtype=np.float64)
-    log_norm = logsumexp(log_weights)
+    log_norm = float(logsumexp(log_weights))
     normalized = np.exp(log_weights - log_norm)
     ess = float(1.0 / np.sum(normalized * normalized))
     events = np.asarray([rare_event_indicator(phi, threshold, direction) for phi in phi_values], dtype=bool)
@@ -294,7 +288,7 @@ def run_mixture_mcmc(
     )
     if samples:
         log_weights = np.asarray([sample.log_weight for sample in samples], dtype=np.float64)
-        normalized = np.exp(log_weights - logsumexp(log_weights))
+        normalized = np.exp(log_weights - float(logsumexp(log_weights)))
         for sample, weight in zip(samples, normalized):
             sample.normalized_weight = float(weight)
 
