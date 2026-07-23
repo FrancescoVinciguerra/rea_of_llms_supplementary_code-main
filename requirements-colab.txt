@@ -1,0 +1,7 @@
+numpy>=1.26
+pandas>=2.0
+matplotlib>=3.8
+textstat>=0.7.3
+transformers>=4.40
+pymbar>=4.0.3
+pytest>=8.0
