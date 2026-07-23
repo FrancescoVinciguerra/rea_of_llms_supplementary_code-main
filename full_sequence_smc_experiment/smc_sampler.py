@@ -238,17 +238,20 @@ def run_full_sequence_smc(
 
     total_accepted = 0
     total_proposals = 0
-
+# Per ogni lambda eseuog (lambda_0 ... lambda_k):
     for level in range(1, len(config.lambdas)):
         previous_lambda = float(config.lambdas[level - 1])
         current_lambda = float(config.lambdas[level])
         level_accepted = 0
         level_proposals = 0
 
+        
         # Mutation step: apply a short independent-proposal MH chain targeting
         # p_{k-1}(x) proportional to p_M(x | c) exp(-lambda_{k-1} phi(x)).
         # The p_M proposal terms cancel, leaving only the phi difference.
         for _ in range(config.mcmc_steps_per_level):
+
+    #genero completions
             proposal_tokens = generate_base_sequences(
                 model,
                 prompt_ids,
@@ -256,6 +259,7 @@ def run_full_sequence_smc(
                 max_new_tokens=config.max_new_tokens,
                 generator=torch_generator,
             )
+    # states_.. prende i token di completion e li separa dal blocco c, ottiene la frase completa e calcola l 'ari
             proposals = states_from_token_sequences(
                 tokenizer,
                 observable,
@@ -263,6 +267,7 @@ def run_full_sequence_smc(
                 prompt_token_count=prompt_token_count,
                 token_sequences=proposal_tokens,
             )
+    # per ogni particella ( proposal = x_k), calcolo la sua acceptance prob, e eventualmente setta la x_k come proposal
             for idx, proposal in enumerate(proposals):
                 current = particles[idx]
                 # log A = -lambda_{k-1} [phi(x*) - phi(x)].
