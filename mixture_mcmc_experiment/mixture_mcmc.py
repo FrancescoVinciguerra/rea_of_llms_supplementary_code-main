@@ -104,10 +104,14 @@ def logsumexp(values: Iterable[float]) -> float:
 
 
 def log_mixture_tilt(phi: float, lambdas: list[float], rhos: list[float]) -> float:
+    # log sum_k rho_k exp(-lambda_k phi). The p_M(x | c) factor cancels from
+    # all mixture acceptance ratios and from the SNIS weights used below.
     return logsumexp(math.log(rho) - lam * phi for lam, rho in zip(lambdas, rhos) if rho > 0.0)
 
 
 def log_component_correction_sum(phi: float, component_index: int, lambdas: list[float], rhos: list[float]) -> float:
+    # log S_k(x), where S_k(x) = Gamma_mix(x) / gamma_k(x). This correction
+    # turns a component-wise MH move into a valid move for the full mixture.
     lambda_k = lambdas[component_index]
     return logsumexp(math.log(rho) - (lam - lambda_k) * phi for lam, rho in zip(lambdas, rhos) if rho > 0.0)
 
@@ -142,6 +146,7 @@ def importance_summary(phi_values: list[float], *, lambdas: list[float], rhos: l
             "mixture_rare_event_count": 0,
             "snis_rare_event_probability": float("nan"),
         }
+    # SNIS back to p_M: p_M / Gamma_mix = 1 / sum_k rho_k exp(-lambda_k phi).
     log_weights = np.asarray([-log_mixture_tilt(phi, lambdas, rhos) for phi in phi_values], dtype=np.float64)
     log_norm = logsumexp(log_weights)
     normalized = np.exp(log_weights - log_norm)
@@ -159,6 +164,7 @@ def importance_summary(phi_values: list[float], *, lambdas: list[float], rhos: l
 def generate_independent_tokens(model, prompt_ids: list[int], max_length: int) -> list[int]:
     import torch
 
+    # Independent proposal x* ~ p_M(. | c), used by every mixture component.
     input_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=next(model.parameters()).device)
     with torch.no_grad():
         output = model.generate(
@@ -223,14 +229,20 @@ def run_mixture_mcmc(
     phi_trace = [float(current.phi)]
 
     for step in range(1, cfg.num_iterations + 1):
+        # Choose which tilted component gamma_k proposes this MH move.
         component_index = int(rng.choice(len(cfg.lambdas), p=np.asarray(rhos, dtype=np.float64)))
         lambda_k = cfg.lambdas[component_index]
 
         proposal_ids = generate_independent_tokens(model, prompt_ids, max_length)
         proposal = state_from_tokens(tokenizer, observable, prompt=prompt, prompt_token_count=prompt_token_count, token_ids=proposal_ids)
 
+        # Component acceptance for gamma_k. Because the proposal is p_M, the
+        # base-model probabilities cancel and only the observable difference
+        # remains.
         log_a_ratio = component_log_acceptance_ratio(lambda_k, current.phi, proposal.phi)
         component_alpha = acceptance_from_log_ratio(log_a_ratio)
+
+        # Mixture correction B_k = min(1, S_k(x*) / S_k(x)).
         log_b_ratio = log_component_correction_sum(proposal.phi, component_index, cfg.lambdas, rhos) - log_component_correction_sum(
             current.phi,
             component_index,
@@ -247,6 +259,8 @@ def run_mixture_mcmc(
         phi_trace.append(float(current.phi))
         should_save = step > cfg.burn_in and ((step - cfg.burn_in - 1) % cfg.thinning == 0)
         if should_save:
+            # Store unnormalised SNIS weight for estimating expectations under
+            # the original base language model p_M.
             log_weight = -log_mixture_tilt(float(current.phi), cfg.lambdas, rhos)
             samples.append(
                 SampleRecord(

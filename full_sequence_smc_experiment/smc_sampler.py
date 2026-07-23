@@ -132,6 +132,9 @@ def generate_base_sequences(
     max_new_tokens: int,
     generator: torch.Generator,
 ) -> list[list[int]]:
+    # Draw complete continuations from the base language model p_M. These draws
+    # are used both to initialise the particle population and as independent
+    # Metropolis proposals inside the full-sequence SMC mutation kernel.
     device = next(model.parameters()).device
     batch_ids = [list(prompt_ids) for _ in range(num_sequences)]
     for _ in range(max_new_tokens):
@@ -153,6 +156,8 @@ def states_from_token_sequences(
     prompt_token_count: int,
     token_sequences: list[list[int]],
 ) -> list[FullSequenceState]:
+    # A particle state is a full completion plus its observable value phi(x).
+    # The SMC algorithm below works on full completions, not on token prefixes.
     completion_ids = [ids[prompt_token_count:] for ids in token_sequences]
     completions = _decode_completions(tokenizer, completion_ids)
     score_batch = getattr(observable, "score_token_sequences", None)
@@ -201,6 +206,8 @@ def run_full_sequence_smc(
     prompt_token_count = len(prompt_ids)
     start = time.perf_counter()
 
+    # Level 0 is sampled from p_M. Therefore the usual schedule should start at
+    # lambda=0; otherwise an initial importance correction would be needed.
     initial_tokens = generate_base_sequences(
         model,
         prompt_ids,
@@ -238,6 +245,9 @@ def run_full_sequence_smc(
         level_accepted = 0
         level_proposals = 0
 
+        # Mutation step: apply a short independent-proposal MH chain targeting
+        # p_{k-1}(x) proportional to p_M(x | c) exp(-lambda_{k-1} phi(x)).
+        # The p_M proposal terms cancel, leaving only the phi difference.
         for _ in range(config.mcmc_steps_per_level):
             proposal_tokens = generate_base_sequences(
                 model,
@@ -255,6 +265,7 @@ def run_full_sequence_smc(
             )
             for idx, proposal in enumerate(proposals):
                 current = particles[idx]
+                # log A = -lambda_{k-1} [phi(x*) - phi(x)].
                 log_acceptance_ratio = -previous_lambda * (proposal.phi - current.phi)
                 acceptance_probability = acceptance_from_log_ratio(log_acceptance_ratio)
                 did_accept = bool(rng.random() < acceptance_probability)
@@ -266,6 +277,8 @@ def run_full_sequence_smc(
                     total_accepted += 1
 
         phi_values = np.asarray([particle.phi for particle in particles], dtype=np.float64)
+        # Reweight from gamma_{k-1} to gamma_k:
+        # log w_k = log w_{k-1} - (lambda_k - lambda_{k-1}) phi(x).
         log_weights = log_weights - (current_lambda - previous_lambda) * phi_values
         ess_over_n = ess_over_n_from_log_weights(log_weights)
         ess_trajectory.append(ess_over_n)
@@ -284,6 +297,7 @@ def run_full_sequence_smc(
         )
 
     elapsed = time.perf_counter() - start
+    # Normalised weights define the final empirical approximation of p_K.
     normalized_log_weights = normalize_log_weights(log_weights)
     normalized_weights = np.exp(normalized_log_weights)
     final_phi = np.asarray([particle.phi for particle in particles], dtype=np.float64)
