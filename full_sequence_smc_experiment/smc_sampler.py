@@ -110,6 +110,14 @@ def rare_event_indicator(phi: float, threshold: float, direction: str) -> bool:
     raise ValueError("direction must be one of {'ge', 'le'}")
 
 
+def rare_event_mask(phi_values: np.ndarray, threshold: float, direction: str) -> np.ndarray:
+    if direction == "ge":
+        return np.asarray(phi_values, dtype=np.float64) >= threshold
+    if direction == "le":
+        return np.asarray(phi_values, dtype=np.float64) <= threshold
+    raise ValueError("direction must be one of {'ge', 'le'}")
+
+
 def _prompt_ids(tokenizer, prompt: str) -> list[int]:
     encoded = tokenizer(prompt, return_tensors="pt")["input_ids"]
     if hasattr(encoded, "detach"):
@@ -505,13 +513,7 @@ def run_full_sequence_smc(
     normalized_log_weights = normalize_log_weights(log_weights)
     normalized_weights = np.exp(normalized_log_weights)
     final_phi = particle_phi_values(particles)
-    rare_events = np.asarray(
-        [
-            rare_event_indicator(float(phi), config.rare_event_threshold, config.rare_event_direction)
-            for phi in final_phi
-        ],
-        dtype=bool,
-    )
+    rare_events = rare_event_mask(final_phi, config.rare_event_threshold, config.rare_event_direction)
 
     samples = build_weighted_particle_samples(
         particles,
