@@ -270,6 +270,17 @@ def metropolis_hastings_log_acceptance_ratio(
     return -target_lambda * (proposal_phi - current_phi)
 
 
+def metropolis_hastings_acceptance_probabilities(log_acceptance_ratios: np.ndarray) -> np.ndarray:
+    # A = min(1, exp(log A)), evaluated for all particles at once.
+    log_ratios = np.asarray(log_acceptance_ratios, dtype=np.float64)
+    probabilities = np.ones_like(log_ratios, dtype=np.float64)
+    negative = log_ratios < 0.0
+    finite_negative = negative & (log_ratios >= -745.0)
+    probabilities[finite_negative] = np.exp(log_ratios[finite_negative])
+    probabilities[log_ratios < -745.0] = 0.0
+    return probabilities
+
+
 def apply_mcmc_mutation_kernel(
     particles: list[FullSequenceState],
     model,
@@ -305,18 +316,18 @@ def apply_mcmc_mutation_kernel(
             generator=torch_generator,
             pad_token_id=pad_token_id,
         )
-        for idx, proposal in enumerate(proposals):
-            current = mutated_particles[idx]
-            log_acceptance_ratio = metropolis_hastings_log_acceptance_ratio(
-                target_lambda=target_lambda,
-                current_phi=current.phi,
-                proposal_phi=proposal.phi,
-            )
-            acceptance_probability = acceptance_from_log_ratio(log_acceptance_ratio)
-            proposals_count += 1
-            if bool(rng.random() < acceptance_probability):
-                mutated_particles[idx] = proposal
-                accepted += 1
+        current_phi = particle_phi_values(mutated_particles)
+        proposal_phi = particle_phi_values(proposals)
+        log_acceptance_ratios = -target_lambda * (proposal_phi - current_phi)
+        acceptance_probabilities = metropolis_hastings_acceptance_probabilities(log_acceptance_ratios)
+        accepted_mask = rng.random(len(mutated_particles)) < acceptance_probabilities
+
+        mutated_particles = [
+            proposal if is_accepted else current
+            for current, proposal, is_accepted in zip(mutated_particles, proposals, accepted_mask)
+        ]
+        accepted += int(np.sum(accepted_mask))
+        proposals_count += len(proposals)
 
     return MutationResult(particles=mutated_particles, accepted=accepted, proposals=proposals_count)
 
