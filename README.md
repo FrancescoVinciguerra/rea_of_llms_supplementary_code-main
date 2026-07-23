@@ -49,6 +49,14 @@ pip install -r requirements-colab.txt
 
 Open `notebooks/REA_Colab_Quickstart.ipynb` for a clean end-to-end notebook with GPU checks, smoke tests, Drive output paths, and selected-result publishing instructions.
 
+To compare against the official supplementary code from the paper, clone with submodules:
+
+```bash
+git clone --recurse-submodules https://github.com/FrancescoVinciguerra/rea_of_llms_supplementary_code-main
+```
+
+The official paper code is tracked as a Git submodule at `external/rea_of_llms_official`. Open `notebooks/compare_with_official_colab.ipynb` in Colab to run this repository's SMC pipeline and the official notebook-based TPS/MBAR examples in the same runtime, with shared seeds and comparable small-example budgets.
+
 ## Smoke Runs
 
 Full-sequence SMC:

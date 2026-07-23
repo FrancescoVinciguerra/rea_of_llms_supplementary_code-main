@@ -1,0 +1,3 @@
+[submodule "external/rea_of_llms_official"]
+	path = external/rea_of_llms_official
+	url = https://github.com/MLiS-Research/rea_of_llms_supplementary_code.git
