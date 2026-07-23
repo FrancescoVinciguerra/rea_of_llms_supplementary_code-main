@@ -138,8 +138,9 @@ def main() -> None:
     write_json(args.output_dir / "mixture_summary.json", enriched_summary)
     write_json(args.output_dir / "summary.json", {"summary": enriched_summary, "config": run_config, "diagnostics": result.diagnostics})
     write_csv(args.output_dir / "summary.csv", [enriched_summary])
-    write_jsonl(args.output_dir / "mixture_samples.jsonl", [sample.to_dict() for sample in result.samples])
-    pd.DataFrame([sample.to_dict() for sample in result.samples]).to_csv(args.output_dir / "mixture_samples.csv", index=False)
+    sample_rows = [sample.to_dict() for sample in result.samples]
+    write_jsonl(args.output_dir / "mixture_samples.jsonl", sample_rows)
+    pd.DataFrame(sample_rows).to_csv(args.output_dir / "mixture_samples.csv", index=False)
 
     direct_summary = None
     if direct is not None:
@@ -164,7 +165,7 @@ def main() -> None:
             output_dir=args.output_dir,
             publish_root=args.publish_result_dir,
             run_name=run_name,
-            samples=[sample.to_dict() for sample in result.samples],
+            samples=sample_rows,
         )
     print(report)
 

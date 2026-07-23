@@ -73,6 +73,13 @@ class LMState:
     raw_ari: float | None
 
 
+@dataclass(frozen=True)
+class MixtureTiltParameters:
+    lambdas: np.ndarray
+    rhos: np.ndarray
+    log_rhos: np.ndarray
+
+
 def parse_float_list(value: str) -> list[float]:
     try:
         parsed = [float(part.strip()) for part in value.split(",") if part.strip()]
@@ -95,19 +102,46 @@ def normalize_rhos(rhos: Iterable[float]) -> list[float]:
     return (arr / total).astype(float).tolist()
 
 
+def build_tilt_parameters(lambdas: Iterable[float], rhos: Iterable[float]) -> MixtureTiltParameters:
+    lambda_array = np.asarray(list(lambdas), dtype=np.float64)
+    rho_array = np.asarray(list(rhos), dtype=np.float64)
+    if lambda_array.size == 0:
+        raise ValueError("lambdas must be non-empty")
+    if lambda_array.shape != rho_array.shape:
+        raise ValueError("lambdas and rhos must have the same length")
+    if np.any(~np.isfinite(lambda_array)):
+        raise ValueError("all lambdas must be finite")
+    if np.any(~np.isfinite(rho_array)) or np.any(rho_array < 0.0):
+        raise ValueError("all rhos must be finite and non-negative")
+    if float(np.sum(rho_array)) <= 0.0:
+        raise ValueError("at least one rho must be positive")
+
+    normalized_rhos = rho_array / float(np.sum(rho_array))
+    log_rhos = np.full_like(normalized_rhos, -np.inf, dtype=np.float64)
+    positive = normalized_rhos > 0.0
+    log_rhos[positive] = np.log(normalized_rhos[positive])
+    return MixtureTiltParameters(lambdas=lambda_array, rhos=normalized_rhos, log_rhos=log_rhos)
+
+
+def log_mixture_tilt_from_parameters(phi: float, tilt: MixtureTiltParameters) -> float:
+    return float(logsumexp(tilt.log_rhos - tilt.lambdas * float(phi)))
+
+
 def log_mixture_tilt(phi: float, lambdas: list[float], rhos: list[float]) -> float:
     # log sum_k rho_k exp(-lambda_k phi). The p_M(x | c) factor cancels from
     # all mixture acceptance ratios and from the SNIS weights used below.
-    terms = [math.log(rho) - lam * phi for lam, rho in zip(lambdas, rhos) if rho > 0.0]
-    return float(logsumexp(terms))
+    return log_mixture_tilt_from_parameters(phi, build_tilt_parameters(lambdas, rhos))
+
+
+def log_component_correction_sum_from_parameters(phi: float, component_index: int, tilt: MixtureTiltParameters) -> float:
+    lambda_k = float(tilt.lambdas[component_index])
+    return float(logsumexp(tilt.log_rhos - (tilt.lambdas - lambda_k) * float(phi)))
 
 
 def log_component_correction_sum(phi: float, component_index: int, lambdas: list[float], rhos: list[float]) -> float:
     # log S_k(x), where S_k(x) = Gamma_mix(x) / gamma_k(x). This correction
     # turns a component-wise MH move into a valid move for the full mixture.
-    lambda_k = lambdas[component_index]
-    terms = [math.log(rho) - (lam - lambda_k) * phi for lam, rho in zip(lambdas, rhos) if rho > 0.0]
-    return float(logsumexp(terms))
+    return log_component_correction_sum_from_parameters(phi, component_index, build_tilt_parameters(lambdas, rhos))
 
 
 def acceptance_from_log_ratio(log_ratio: float) -> float:
@@ -130,7 +164,24 @@ def rare_event_indicator(phi: float, threshold: float, direction: str) -> bool:
     raise ValueError("direction must be one of {'ge', 'le'}")
 
 
-def importance_summary(phi_values: list[float], *, lambdas: list[float], rhos: list[float], threshold: float, direction: str) -> dict[str, Any]:
+def mixture_log_weights(phi_values: list[float], tilt: MixtureTiltParameters) -> np.ndarray:
+    phi_array = np.asarray(phi_values, dtype=np.float64)
+    log_mixture_values = logsumexp(
+        tilt.log_rhos[None, :] - phi_array[:, None] * tilt.lambdas[None, :],
+        axis=1,
+    )
+    return -np.asarray(log_mixture_values, dtype=np.float64)
+
+
+def importance_summary(
+    phi_values: list[float],
+    *,
+    lambdas: list[float],
+    rhos: list[float],
+    threshold: float,
+    direction: str,
+    tilt: MixtureTiltParameters | None = None,
+) -> dict[str, Any]:
     n = len(phi_values)
     if n == 0:
         return {
@@ -141,7 +192,8 @@ def importance_summary(phi_values: list[float], *, lambdas: list[float], rhos: l
             "snis_rare_event_probability": float("nan"),
         }
     # SNIS back to p_M: p_M / Gamma_mix = 1 / sum_k rho_k exp(-lambda_k phi).
-    log_weights = np.asarray([-log_mixture_tilt(phi, lambdas, rhos) for phi in phi_values], dtype=np.float64)
+    tilt_parameters = tilt if tilt is not None else build_tilt_parameters(lambdas, rhos)
+    log_weights = mixture_log_weights(phi_values, tilt_parameters)
     log_norm = float(logsumexp(log_weights))
     normalized = np.exp(log_weights - log_norm)
     ess = float(1.0 / np.sum(normalized * normalized))
@@ -208,6 +260,7 @@ def run_mixture_mcmc(
         rare_event_direction=config.rare_event_direction,
         max_new_tokens=config.max_new_tokens,
     )
+    tilt = build_tilt_parameters(cfg.lambdas, rhos)
     set_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
     prompt_ids = tokenizer(prompt, return_tensors="pt")["input_ids"][0].tolist()
@@ -224,8 +277,8 @@ def run_mixture_mcmc(
 
     for step in range(1, cfg.num_iterations + 1):
         # Choose which tilted component gamma_k proposes this MH move.
-        component_index = int(rng.choice(len(cfg.lambdas), p=np.asarray(rhos, dtype=np.float64)))
-        lambda_k = cfg.lambdas[component_index]
+        component_index = int(rng.choice(len(tilt.lambdas), p=tilt.rhos))
+        lambda_k = float(tilt.lambdas[component_index])
 
         proposal_ids = generate_independent_tokens(model, prompt_ids, max_length)
         proposal = state_from_tokens(tokenizer, observable, prompt=prompt, prompt_token_count=prompt_token_count, token_ids=proposal_ids)
@@ -237,11 +290,10 @@ def run_mixture_mcmc(
         component_alpha = acceptance_from_log_ratio(log_a_ratio)
 
         # Mixture correction B_k = min(1, S_k(x*) / S_k(x)).
-        log_b_ratio = log_component_correction_sum(proposal.phi, component_index, cfg.lambdas, rhos) - log_component_correction_sum(
+        log_b_ratio = log_component_correction_sum_from_parameters(proposal.phi, component_index, tilt) - log_component_correction_sum_from_parameters(
             current.phi,
             component_index,
-            cfg.lambdas,
-            rhos,
+            tilt,
         )
         mixture_alpha = acceptance_from_log_ratio(log_b_ratio)
         acceptance_probability = component_alpha * mixture_alpha
@@ -255,7 +307,7 @@ def run_mixture_mcmc(
         if should_save:
             # Store unnormalised SNIS weight for estimating expectations under
             # the original base language model p_M.
-            log_weight = -log_mixture_tilt(float(current.phi), cfg.lambdas, rhos)
+            log_weight = -log_mixture_tilt_from_parameters(float(current.phi), tilt)
             samples.append(
                 SampleRecord(
                     text=prompt + current.completion,
@@ -285,6 +337,7 @@ def run_mixture_mcmc(
         rhos=rhos,
         threshold=cfg.rare_event_threshold,
         direction=cfg.rare_event_direction,
+        tilt=tilt,
     )
     if samples:
         log_weights = np.asarray([sample.log_weight for sample in samples], dtype=np.float64)
